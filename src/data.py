@@ -1,141 +1,157 @@
 """Data loading for the Nurtec waterfall app.
 
-Two sources:
-  1. LAAD quarter metrics -- long-format with columns
-       QTR, CLAIM_TYPE, BRAND, PAYER, METRIC, VALUE.
-     Reshaped to a nested dict keyed by BRAND -> PAYER -> METRIC -> VALUE.
+All data comes from Snowflake. There is no bundled-CSV or Dataiku fallback --
+extracted LAAD/NPA data is licensed and must not live in the repo.
 
-  2. NPA monthly metrics -- used only to compute Nurtec's NPA-level market share
-     per quarter, so the LAAD waterfall can be rescaled to real-world NPA.
+Two sources
+-----------
+1. LAAD quarter metrics -- long-format with columns
+     QTR, CLAIM_TYPE, BRAND, PAYER, METRIC, VALUE.
+   Reshaped to a nested dict keyed by BRAND -> PAYER -> METRIC -> VALUE.
 
-Loading strategy
-----------------
-Each source tries three loaders in order and uses the first one that works:
+2. NPA quarterly market share -- pre-computed upstream, one row per
+   (QTR, BRAND, TYPE). Used only to rescale the LAAD waterfall into NPA
+   (real-world) market-share space.
 
-  1. Dataiku Dataset API (`dataiku.Dataset(name).get_dataframe()`).
-     LAAD dataset name defaults to `SQL_NURTEC_WATERFALL_QTR_METRICS`, override
-     with env var `DKU_LAAD_DATASET`. NPA is skipped by default because there
-     is no equivalent Dataiku dataset today; set `DKU_NPA_DATASET` to opt in.
-  2. Bundled CSV under `data/laad.csv` / `data/npa.csv`.
-  3. Snowflake via `st.connection("snowflake")` (lazy import, so environments
-     without `snowflake-snowpark-python` won't fail at module load).
+Conventions that matter
+-----------------------
+* `NPA_MS` is a FRACTION (0-1). The source column `MARKET_SHARE` is already
+  stored that way, so no scaling is applied here. Callers multiply by 100 for
+  display.
+* The NPA source stores `TYPE` mixed-case ('TRx' / 'NBRx') while the app passes
+  'TRX' / 'NBRX', hence the case-insensitive comparison.
+* Quarter completeness is derived from the NPA max-date watermark: a quarter is
+  complete only once its end date is on or before the watermark. The LAAD and
+  NPA tables are built in the same upstream run, so one watermark gates both.
 """
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-LAAD_TABLE = "VAW_AMER_DESIGN.USPRIMARYCAREADHOCANALYTICSPARTC.USPRIMARYCAREADHOCANALYTICSPARTC_SQL_NURTEC_WATERFALL_QTR_METRICS"
-NPA_TABLE = "VAW_AMER_DESIGN.FORECASTING_DATA_ECOSYSTEM.FORECASTING_DATA_ECOSYSTEM_NURTEC_NPA_METRICS"
+_SCHEMA = "VAW_AMER_DESIGN.USPRIMARYCAREADHOCANALYTICSPARTC"
+_PREFIX = "USPRIMARYCAREADHOCANALYTICSPARTC"
 
-_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-_LAAD_CSV = _DATA_DIR / "laad.csv"
-_NPA_CSV = _DATA_DIR / "npa.csv"
+LAAD_TABLE = f"{_SCHEMA}.{_PREFIX}_SQL_NURTEC_WATERFALL_QTR_METRICS"
+NPA_MS_TABLE = f"{_SCHEMA}.{_PREFIX}_SQL_NURTEC_WATERFALL_NPA_MARKET_SHARE_SF"
+MAX_DATE_TABLE = f"{_SCHEMA}.{_PREFIX}_SQL_NPA_MAX_DATE_SF"
 
-_DKU_LAAD_DATASET = os.getenv("DKU_LAAD_DATASET", "SQL_NURTEC_WATERFALL_QTR_METRICS")
-_DKU_NPA_DATASET = os.getenv("DKU_NPA_DATASET")  # None by default; opt-in
-
-
-def _try_dataiku(dataset_name: str | None) -> pd.DataFrame | None:
-    """Load a Dataiku Dataset by name. Returns None if Dataiku or the dataset
-    isn't available in this environment."""
-    if not dataset_name:
-        return None
-    try:
-        import dataiku  # type: ignore
-    except Exception:
-        return None
-    try:
-        return dataiku.Dataset(dataset_name).get_dataframe()
-    except Exception:
-        return None
+# The app's radio passes these; used as an allowlist so claim_type is never
+# interpolated into SQL unvalidated.
+_VALID_CLAIM_TYPES = ("TRX", "NBRX")
 
 
 def _get_session():
-    """Lazy: return a Snowpark session via st.connection.
+    """Return a Snowpark session.
 
-    Only invoked when Dataiku + CSV loaders both miss, so environments without
-    the Snowflake connector installed never trip the import.
+    Prefers the active Streamlit-in-Snowflake session. `st.connection` is a
+    fallback so a single untested call path isn't the only way in.
     """
-    conn = st.connection("snowflake", ttl=os.getenv("SNOWFLAKE_CONNECTION_TTL"))
-    return conn.session()
+    try:
+        from snowflake.snowpark.context import get_active_session
+
+        return get_active_session()
+    except Exception:
+        conn = st.connection("snowflake", ttl=os.getenv("SNOWFLAKE_CONNECTION_TTL"))
+        return conn.session()
 
 
 @st.cache_data(ttl=3600, show_spinner="Loading LAAD waterfall metrics...")
 def load_laad() -> pd.DataFrame:
-    df = _try_dataiku(_DKU_LAAD_DATASET)
-    if df is None:
-        if _LAAD_CSV.exists():
-            df = pd.read_csv(_LAAD_CSV)
-        else:
-            session = _get_session()
-            df = session.sql(
-                f"SELECT QTR, CLAIM_TYPE, BRAND, PAYER, METRIC, VALUE FROM {LAAD_TABLE}"
-            ).to_pandas()
+    session = _get_session()
+    df = session.sql(
+        f"SELECT QTR, CLAIM_TYPE, BRAND, PAYER, METRIC, VALUE FROM {LAAD_TABLE}"
+    ).to_pandas()
     df.columns = [c.upper() for c in df.columns]
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading NPA metrics...")
-def load_npa_monthly() -> pd.DataFrame:
-    df = _try_dataiku(_DKU_NPA_DATASET)
-    if df is None:
-        if _NPA_CSV.exists():
-            df = pd.read_csv(_NPA_CSV)
-        else:
-            session = _get_session()
-            df = session.sql(
-                f"""
-                SELECT DATE, PRODUCT_NAME, METRIC, METRIC_VALUE
-                FROM {NPA_TABLE}
-                WHERE SOURCE = 'NPA'
-                  AND MARKET_CLASS = 'TOTAL'
-                  AND METRIC IN ('TRx','NRx','OCGRP_TRx','OCGRP_NRx')
-                """
-            ).to_pandas()
-    df.columns = [c.upper() for c in df.columns]
-    df["DATE"] = pd.to_datetime(df["DATE"])
-    df["QTR"] = df["DATE"].dt.to_period("Q").astype(str)
-    # If we pulled the raw NPA dataset from Dataiku, apply the same filter used
-    # in the Snowflake query so downstream aggregation matches.
-    if "SOURCE" in df.columns and "MARKET_CLASS" in df.columns:
-        df = df[
-            (df["SOURCE"] == "NPA")
-            & (df["MARKET_CLASS"] == "TOTAL")
-            & (df["METRIC"].isin(["TRx", "NRx", "OCGRP_TRx", "OCGRP_NRx"]))
-        ].reset_index(drop=True)
-    return df
-
-
+@st.cache_data(ttl=3600, show_spinner="Loading NPA market share...")
 def npa_market_share_by_qtr(claim_type: str) -> pd.DataFrame:
-    """Quarterly Nurtec NPA market share.
+    """Quarterly Nurtec NPA market share, pre-computed upstream.
 
-    For TRx  -> Nurtec TRx / OCGRP_TRx.
-    For NBRx -> Nurtec NRx / OCGRP_NRx  (NPA has no NBRx grain; NRx is the
-    closest analogue at the market level).
+    Returns columns QTR and NPA_MS, where NPA_MS is a fraction (0-1).
+
+    Unlike the previous implementation, NBRx is true NBRx rather than an NRx
+    proxy -- the upstream table carries both grains explicitly.
     """
-    monthly = load_npa_monthly()
-    if claim_type.upper() == "TRX":
-        nurtec_metric, market_metric = "TRx", "OCGRP_TRx"
-    else:
-        nurtec_metric, market_metric = "NRx", "OCGRP_NRx"
+    ct = claim_type.upper()
+    if ct not in _VALID_CLAIM_TYPES:
+        raise ValueError(
+            f"Unsupported claim_type {claim_type!r}; expected one of {_VALID_CLAIM_TYPES}"
+        )
 
-    nurtec = (
-        monthly[(monthly["PRODUCT_NAME"] == "NURTEC") & (monthly["METRIC"] == nurtec_metric)]
-        .groupby("QTR", as_index=False)["METRIC_VALUE"].sum()
-        .rename(columns={"METRIC_VALUE": "NURTEC_VOL"})
-    )
-    market = (
-        monthly[(monthly["PRODUCT_NAME"] == "OVERALL") & (monthly["METRIC"] == market_metric)]
-        .groupby("QTR", as_index=False)["METRIC_VALUE"].sum()
-        .rename(columns={"METRIC_VALUE": "MARKET_VOL"})
-    )
-    out = nurtec.merge(market, on="QTR", how="inner")
-    out["NPA_MS"] = out["NURTEC_VOL"] / out["MARKET_VOL"]
-    return out.sort_values("QTR").reset_index(drop=True)
+    session = _get_session()
+    df = session.sql(
+        f"""
+        SELECT QTR, MARKET_SHARE AS NPA_MS
+        FROM {NPA_MS_TABLE}
+        WHERE UPPER(BRAND) = 'NURTEC'
+          AND UPPER(TYPE) = '{ct}'
+        """
+    ).to_pandas()
+    df.columns = [c.upper() for c in df.columns]
+    return df.sort_values("QTR").reset_index(drop=True)
+
+
+# ---------- Quarter completeness ----------------------------------------
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def npa_max_date() -> pd.Timestamp | None:
+    """How far the NPA data extends.
+
+    Returns None if the watermark can't be read, so a missing marker costs the
+    completeness callout rather than the whole app.
+    """
+    try:
+        session = _get_session()
+        df = session.sql(f"SELECT MAX_DT FROM {MAX_DATE_TABLE}").to_pandas()
+        df.columns = [c.upper() for c in df.columns]
+        if df.empty or pd.isna(df["MAX_DT"].iloc[0]):
+            return None
+        return pd.Timestamp(df["MAX_DT"].iloc[0])
+    except Exception:
+        return None
+
+
+def quarter_end(qtr: str) -> pd.Timestamp | None:
+    """'2026Q3' -> Timestamp('2026-09-30'). None if unparseable."""
+    try:
+        return pd.Period(qtr, freq="Q").end_time.normalize()
+    except Exception:
+        return None
+
+
+def incomplete_quarters(qtrs: list) -> set:
+    """Quarters whose end date falls after the NPA watermark.
+
+    An unreadable watermark or an unparseable quarter yields "assume complete",
+    so this never hides data on the strength of a failed lookup.
+    """
+    max_dt = npa_max_date()
+    if max_dt is None:
+        return set()
+    out = set()
+    for q in qtrs:
+        qe = quarter_end(q)
+        if qe is not None and qe > max_dt:
+            out.add(q)
+    return out
+
+
+def latest_complete_quarter(qtrs: list) -> str | None:
+    """Newest quarter in `qtrs` that is not partial, else the newest overall."""
+    if not qtrs:
+        return None
+    partial = incomplete_quarters(qtrs)
+    complete = [q for q in sorted(qtrs) if q not in partial]
+    return complete[-1] if complete else sorted(qtrs)[-1]
+
+
+# ---------- Reshaping ---------------------------------------------------
 
 
 def available_quarters(df: pd.DataFrame, claim_type: str) -> list:

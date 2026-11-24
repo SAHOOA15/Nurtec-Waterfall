@@ -1,10 +1,13 @@
 """Nurtec QoQ NBRx & TRx Waterfall -- Streamlit app.
 
 Pick a Claim Type (NBRx/TRx), a previous quarter, and a current quarter.
-The app queries the Nurtec LAAD waterfall metrics + NPA metrics from
-Snowflake, decomposes the market-share change into WD / Rejections /
-Reversals / Other reasons (with a payer-level breakdown), and renders
-LAAD-level and NPA-scaled waterfall charts.
+The app queries the Nurtec LAAD waterfall metrics and the pre-computed NPA
+quarterly market share from Snowflake, decomposes the market-share change into
+WD / Rejections / Reversals / Other reasons (with a payer-level breakdown), and
+renders LAAD-level and NPA-scaled waterfall charts.
+
+Quarters that are still in progress stay selectable but are kept out of the
+default comparison, and are flagged in every section.
 """
 from __future__ import annotations
 
@@ -17,6 +20,11 @@ from src.data import (
     npa_market_share_by_qtr,
     available_quarters,
     slice_metrics,
+    incomplete_quarters,
+    latest_complete_quarter,
+    npa_max_date,
+    LAAD_TABLE,
+    NPA_MS_TABLE,
 )
 from src.waterfall import build_waterfall, rescale_to_npa, PAYERS, WaterfallResult
 from src.charts import overall_waterfall, payer_breakdown_waterfall, qoq_metric_chart, LEVER_COLORS
@@ -576,6 +584,40 @@ if "view" not in st.session_state:
     st.session_state["view"] = "waterfall"
 
 
+# ---------------- Data currency notice -----------------------------------
+def render_data_currency_notice(incomplete: set, selected: tuple = ()) -> None:
+    """Flag in-progress quarters.
+
+    Renders a standing notice whenever the newest quarter is partial, plus a
+    sharper warning when a partial quarter is one of the two being compared.
+    Called from every section so the caveat travels with the numbers.
+    """
+    if not incomplete:
+        return
+
+    max_dt = npa_max_date()
+    asof = (
+        f" NPA data currently runs through {max_dt:%d %b %Y}."
+        if max_dt is not None
+        else ""
+    )
+    newest = sorted(incomplete)[-1]
+    st.info(
+        f"**{newest} is still in progress.**{asof} It is left out of the default "
+        "quarter selection -- choose it explicitly if you want a partial-quarter view."
+    )
+
+    chosen = [q for q in selected if q in incomplete]
+    if chosen:
+        label = ", ".join(chosen)
+        verb = "cover" if len(chosen) > 1 else "covers"
+        st.warning(
+            f"**Showing {label}**, which {verb} only part of the quarter. The "
+            "quarter-over-quarter delta -- and every lever scaled from it -- will "
+            "understate the full-quarter picture."
+        )
+
+
 # ---------------- Sidebar inputs -----------------------------------------
 with st.sidebar:
     st.markdown(
@@ -591,7 +633,14 @@ with st.sidebar:
 
     claim_type = st.radio("Claim type", ["TRX", "NBRX"], horizontal=True)
 
-    laad = load_laad()
+    try:
+        laad = load_laad()
+    except Exception as e:
+        st.error(
+            "Could not load LAAD waterfall metrics from Snowflake.\n\n"
+            f"Table: `{LAAD_TABLE}`\n\nError: {e}"
+        )
+        st.stop()
     qtrs_laad = available_quarters(laad, claim_type)
     try:
         _npa_all = npa_market_share_by_qtr(claim_type)
@@ -603,14 +652,26 @@ with st.sidebar:
         st.error("Not enough quarters with both LAAD and NPA data.")
         st.stop()
 
-    prev_qtr = st.selectbox("Previous quarter", qtrs, index=max(0, len(qtrs) - 3))
+    # In-progress quarters stay selectable, but must not be the default view.
+    partial_qtrs = incomplete_quarters(qtrs)
+    _default_curr = latest_complete_quarter(qtrs)
+    _complete = [q for q in qtrs if q not in partial_qtrs]
+    _basis = _complete if len(_complete) >= 2 else qtrs
+    _default_prev = _basis[max(0, len(_basis) - 3)]
+
+    prev_qtr = st.selectbox("Previous quarter", qtrs, index=qtrs.index(_default_prev))
     # Current quarter must be strictly after Previous quarter
     _prev_idx = qtrs.index(prev_qtr)
     curr_options = qtrs[_prev_idx + 1:]
     if not curr_options:
         st.warning("Pick an earlier Previous quarter -- no later quarter available.")
         st.stop()
-    curr_qtr = st.selectbox("Current quarter", curr_options, index=len(curr_options) - 1)
+    _curr_idx = (
+        curr_options.index(_default_curr)
+        if _default_curr in curr_options
+        else len(curr_options) - 1
+    )
+    curr_qtr = st.selectbox("Current quarter", curr_options, index=_curr_idx)
 
     st.markdown("<div style='margin-top:1rem'></div>", unsafe_allow_html=True)
     if st.button(
@@ -640,6 +701,7 @@ if st.session_state.get("view") == "business_rules":
         "How the waterfall is built, what \"Other reasons\" means, and why the payer-level "
         "impacts get scaled to match the all-market view."
     )
+    render_data_currency_notice(partial_qtrs, (prev_qtr, curr_qtr))
     _render_notes(expanded=True)
     st.stop()
 
@@ -670,6 +732,7 @@ if st.session_state.get("view") == "calculations":
         st.session_state["view"] = "waterfall"
         st.rerun()
     st.markdown("## Calculations")
+    render_data_currency_notice(partial_qtrs, (prev_qtr, curr_qtr))
     st.subheader(f"Calculation walk-through -- {claim_type}, {prev_qtr} \u2192 {curr_qtr}")
     st.caption(
         "Layout mirrors the workbook's TRx Waterfall / NBRx Waterfall tab (rows 36-130). "
@@ -867,6 +930,7 @@ def render_payer_split_table(
 
 
 with tab_laad:
+    render_data_currency_notice(partial_qtrs, (prev_qtr, curr_qtr))
     _chart_col, _table_col = st.columns([1, 1], gap="medium")
     with _chart_col:
         st.altair_chart(
@@ -891,8 +955,9 @@ with tab_laad:
             )
 
 with tab_npa:
+    render_data_currency_notice(partial_qtrs, (prev_qtr, curr_qtr))
     if not npa_available:
-        msg = f"No NPA rows for {prev_qtr} and/or {curr_qtr} in `{'/'.join(['FORECASTING_DATA_ECOSYSTEM','NURTEC_NPA_METRICS'])}`."
+        msg = f"No NPA rows for {prev_qtr} and/or {curr_qtr} in `{NPA_MS_TABLE}`."
         if npa_error:
             msg += f"\n\nError: {npa_error}"
         st.warning(msg)
@@ -917,6 +982,7 @@ with tab_npa:
             )
 
 with tab_qoq:
+    render_data_currency_notice(partial_qtrs, (prev_qtr, curr_qtr))
     # Metric label -> raw METRIC value in the LAAD table
     _METRIC_OPTIONS = {
         "Written Demand (WD)": "WD",

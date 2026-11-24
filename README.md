@@ -16,12 +16,28 @@ Streamlit-in-Snowflake app that decomposes Nurtec's LAAD market-share change qua
 
 ## Data sources
 
-- LAAD (quarterly, long-format): `<DB>.<SCHEMA>.<..._NURTEC_WATERFALL_QTR_METRICS>`
-- NPA (monthly): `<DB>.<SCHEMA>.<..._NURTEC_NPA_METRICS>`
+All data is read from Snowflake at runtime. There is no bundled CSV and no Dataiku
+fallback — extracted LAAD/NPA data is licensed and is not kept in this repo.
+
+- LAAD (quarterly, long-format): `<DB>.<SCHEMA>.<..._SQL_NURTEC_WATERFALL_QTR_METRICS>`
+- NPA market share (quarterly, pre-computed): `<DB>.<SCHEMA>.<..._SQL_NURTEC_WATERFALL_NPA_MARKET_SHARE_SF>`
+- NPA data watermark: `<DB>.<SCHEMA>.<..._SQL_NPA_MAX_DATE_SF>`
+
+The NPA table carries one row per `(QTR, BRAND, TYPE)` with `MARKET_SHARE` stored as a
+fraction (0–1). `TYPE` holds true `NBRx` and `TRx` grains — NBRx is not approximated
+from NRx.
+
+## Quarter completeness
+
+A quarter counts as complete only once its end date falls on or before the NPA
+watermark. In-progress quarters stay selectable but are kept out of the default
+comparison and are flagged in every section, so a partial quarter cannot quietly
+become the default view. If the watermark cannot be read the app assumes every
+quarter is complete and simply omits the notice.
 
 ## Deploy
 
-Files are deployed to Snowflake via `snow streamlit deploy` (or by uploading through Snowsight Workspaces). The container runtime is Python 3.11.
+Files are deployed to Snowflake via `snow streamlit deploy` (or by uploading through Snowsight Workspaces). The container runtime is Python 3.11. The app expects to run inside Streamlit-in-Snowflake, where it picks up the active session; `st.connection("snowflake")` is used as a fallback.
 
 ## Waterfall convention
 

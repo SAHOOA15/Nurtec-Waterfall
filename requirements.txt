@@ -1,4 +1,4 @@
 streamlit>=1.35
 pandas
-plotly
+altair
 snowflake-snowpark-python
