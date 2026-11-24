@@ -1,10 +1,13 @@
 """Nurtec QoQ NBRx & TRx Waterfall -- Streamlit app.
 
-Pick a Claim Type (NBRx/TRx), a previous quarter, and a current quarter.
-The app queries the Nurtec LAAD waterfall metrics and the pre-computed NPA
-quarterly market share from Snowflake, decomposes the market-share change into
-WD / Rejections / Reversals / Other reasons (with a payer-level breakdown), and
-renders LAAD-level and NPA-scaled waterfall charts.
+Hosted as a Dataiku webapp; reads Dataiku datasets (refreshed from Snowflake on
+a schedule) with a direct-Snowflake fallback so it also runs outside Dataiku.
+
+Pick a Claim Type (NBRx/TRx), a previous quarter, and a current quarter. The app
+loads the Nurtec LAAD waterfall metrics and the pre-computed NPA quarterly
+market share, decomposes the market-share change into WD / Rejections /
+Reversals / Other reasons (with a payer-level breakdown), and renders LAAD-level
+and NPA-scaled waterfall charts.
 
 Quarters that are still in progress stay selectable but are kept out of the
 default comparison, and are flagged in every section.
@@ -23,8 +26,8 @@ from src.data import (
     incomplete_quarters,
     latest_complete_quarter,
     npa_max_date,
-    LAAD_TABLE,
     NPA_MS_TABLE,
+    DKU_NPA_MS_DATASET,
 )
 from src.waterfall import build_waterfall, rescale_to_npa, PAYERS, WaterfallResult
 from src.charts import overall_waterfall, payer_breakdown_waterfall, qoq_metric_chart, LEVER_COLORS
@@ -636,10 +639,9 @@ with st.sidebar:
     try:
         laad = load_laad()
     except Exception as e:
-        st.error(
-            "Could not load LAAD waterfall metrics from Snowflake.\n\n"
-            f"Table: `{LAAD_TABLE}`\n\nError: {e}"
-        )
+        # load_laad() already names both the Dataiku dataset and the Snowflake
+        # table it tried, so surface that verbatim.
+        st.error(f"Could not load LAAD waterfall metrics.\n\n{e}")
         st.stop()
     qtrs_laad = available_quarters(laad, claim_type)
     try:
@@ -957,7 +959,10 @@ with tab_laad:
 with tab_npa:
     render_data_currency_notice(partial_qtrs, (prev_qtr, curr_qtr))
     if not npa_available:
-        msg = f"No NPA rows for {prev_qtr} and/or {curr_qtr} in `{NPA_MS_TABLE}`."
+        msg = (
+            f"No NPA rows for {prev_qtr} and/or {curr_qtr} "
+            f"(source: Dataiku `{DKU_NPA_MS_DATASET}`, else Snowflake `{NPA_MS_TABLE}`)."
+        )
         if npa_error:
             msg += f"\n\nError: {npa_error}"
         st.warning(msg)

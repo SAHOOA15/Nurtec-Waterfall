@@ -1,7 +1,22 @@
 """Data loading for the Nurtec waterfall app.
 
-All data comes from Snowflake. There is no bundled-CSV or Dataiku fallback --
-extracted LAAD/NPA data is licensed and must not live in the repo.
+Loading strategy
+----------------
+Each source tries two loaders and uses the first that works:
+
+  1. **Dataiku Dataset API** (`dataiku.Dataset(name).get_dataframe()`). This is
+     the live path when the app runs as a Dataiku webapp, which is how it is
+     hosted. Dataiku manages dataset refresh from Snowflake on a schedule, so
+     the app always reads the latest build. Matches the pattern used by the
+     sibling Primary_Care_Webapp and Rebate-Decision-Agent apps.
+  2. **Snowflake** via the active Snowpark session (Streamlit-in-Snowflake) or
+     `st.connection("snowflake")`. Keeps the app runnable outside Dataiku.
+
+Dataiku dataset names are the Snowflake table name minus the schema prefix, and
+each can be overridden with an env var for testing.
+
+There is deliberately no bundled-CSV loader: extracted LAAD/NPA data is
+licensed IQVIA plus competitive brand detail and must not live in the repo.
 
 Two sources
 -----------
@@ -18,11 +33,12 @@ Conventions that matter
 * `NPA_MS` is a FRACTION (0-1). The source column `MARKET_SHARE` is already
   stored that way, so no scaling is applied here. Callers multiply by 100 for
   display.
-* The NPA source stores `TYPE` mixed-case ('TRx' / 'NBRx') while the app passes
-  'TRX' / 'NBRX', hence the case-insensitive comparison.
-* Quarter completeness is derived from the NPA max-date watermark: a quarter is
-  complete only once its end date is on or before the watermark. The LAAD and
-  NPA tables are built in the same upstream run, so one watermark gates both.
+* `TYPE` in the NPA source is mixed-case ('TRx' / 'NBRx') while the app passes
+  'TRX' / 'NBRX'. All comparisons are case-insensitive.
+* NBRx is **true NBRx**, not an NRx proxy -- the upstream table carries both
+  grains explicitly.
+* Quarter completeness comes from the NPA max-date watermark: a quarter is
+  complete only once its end date is on or before the watermark.
 """
 from __future__ import annotations
 
@@ -34,20 +50,45 @@ import streamlit as st
 _SCHEMA = "VAW_AMER_DESIGN.USPRIMARYCAREADHOCANALYTICSPARTC"
 _PREFIX = "USPRIMARYCAREADHOCANALYTICSPARTC"
 
+# Snowflake fallback targets.
 LAAD_TABLE = f"{_SCHEMA}.{_PREFIX}_SQL_NURTEC_WATERFALL_QTR_METRICS"
 NPA_MS_TABLE = f"{_SCHEMA}.{_PREFIX}_SQL_NURTEC_WATERFALL_NPA_MARKET_SHARE_SF"
 MAX_DATE_TABLE = f"{_SCHEMA}.{_PREFIX}_SQL_NPA_MAX_DATE_SF"
 
-# The app's radio passes these; used as an allowlist so claim_type is never
-# interpolated into SQL unvalidated.
+# Dataiku dataset names (primary path): Snowflake table minus the schema prefix.
+DKU_LAAD_DATASET = os.getenv("DKU_LAAD_DATASET", "SQL_NURTEC_WATERFALL_QTR_METRICS")
+DKU_NPA_MS_DATASET = os.getenv(
+    "DKU_NPA_MS_DATASET", "SQL_NURTEC_WATERFALL_NPA_MARKET_SHARE_SF"
+)
+DKU_MAX_DATE_DATASET = os.getenv("DKU_MAX_DATE_DATASET", "SQL_NPA_MAX_DATE_SF")
+
+# The app's radio passes these.
 _VALID_CLAIM_TYPES = ("TRX", "NBRX")
 
 
-def _get_session():
-    """Return a Snowpark session.
+def _try_dataiku(dataset_name: str | None) -> pd.DataFrame | None:
+    """Load a Dataiku Dataset by name.
 
-    Prefers the active Streamlit-in-Snowflake session. `st.connection` is a
-    fallback so a single untested call path isn't the only way in.
+    Returns None when Dataiku isn't importable (not running as a Dataiku
+    webapp) or the dataset isn't present, so the caller can fall through to
+    Snowflake.
+    """
+    if not dataset_name:
+        return None
+    try:
+        import dataiku  # type: ignore
+    except Exception:
+        return None
+    try:
+        return dataiku.Dataset(dataset_name).get_dataframe()
+    except Exception:
+        return None
+
+
+def _get_session():
+    """Return a Snowpark session for the Snowflake fallback path.
+
+    Prefers the active Streamlit-in-Snowflake session, then `st.connection`.
     """
     try:
         from snowflake.snowpark.context import get_active_session
@@ -58,24 +99,59 @@ def _get_session():
         return conn.session()
 
 
+def _unavailable(label: str, dataset: str, table: str, err: Exception) -> RuntimeError:
+    """Build an error that names both routes, so a missing Dataiku dataset is
+    immediately diagnosable rather than looking like a Snowflake outage."""
+    return RuntimeError(
+        f"Could not load {label}. Tried the Dataiku dataset '{dataset}' "
+        f"(not found or Dataiku unavailable), then Snowflake table '{table}', "
+        f"which failed with: {err}"
+    )
+
+
 @st.cache_data(ttl=3600, show_spinner="Loading LAAD waterfall metrics...")
 def load_laad() -> pd.DataFrame:
-    session = _get_session()
-    df = session.sql(
-        f"SELECT QTR, CLAIM_TYPE, BRAND, PAYER, METRIC, VALUE FROM {LAAD_TABLE}"
-    ).to_pandas()
+    df = _try_dataiku(DKU_LAAD_DATASET)
+    if df is None:
+        try:
+            session = _get_session()
+            df = session.sql(
+                f"SELECT QTR, CLAIM_TYPE, BRAND, PAYER, METRIC, VALUE FROM {LAAD_TABLE}"
+            ).to_pandas()
+        except Exception as e:
+            raise _unavailable(
+                "LAAD waterfall metrics", DKU_LAAD_DATASET, LAAD_TABLE, e
+            ) from e
     df.columns = [c.upper() for c in df.columns]
     return df
 
 
 @st.cache_data(ttl=3600, show_spinner="Loading NPA market share...")
+def _load_npa_ms() -> pd.DataFrame:
+    """Full NPA market-share table: one row per (QTR, BRAND, TYPE).
+
+    Loaded whole (tens of rows) and filtered in pandas, so the Dataiku and
+    Snowflake paths share one filter implementation.
+    """
+    df = _try_dataiku(DKU_NPA_MS_DATASET)
+    if df is None:
+        try:
+            session = _get_session()
+            df = session.sql(
+                f"SELECT QTR, BRAND, TYPE, MARKET_SHARE FROM {NPA_MS_TABLE}"
+            ).to_pandas()
+        except Exception as e:
+            raise _unavailable(
+                "NPA market share", DKU_NPA_MS_DATASET, NPA_MS_TABLE, e
+            ) from e
+    df.columns = [c.upper() for c in df.columns]
+    return df
+
+
 def npa_market_share_by_qtr(claim_type: str) -> pd.DataFrame:
-    """Quarterly Nurtec NPA market share, pre-computed upstream.
+    """Quarterly Nurtec NPA market share.
 
     Returns columns QTR and NPA_MS, where NPA_MS is a fraction (0-1).
-
-    Unlike the previous implementation, NBRx is true NBRx rather than an NRx
-    proxy -- the upstream table carries both grains explicitly.
     """
     ct = claim_type.upper()
     if ct not in _VALID_CLAIM_TYPES:
@@ -83,17 +159,13 @@ def npa_market_share_by_qtr(claim_type: str) -> pd.DataFrame:
             f"Unsupported claim_type {claim_type!r}; expected one of {_VALID_CLAIM_TYPES}"
         )
 
-    session = _get_session()
-    df = session.sql(
-        f"""
-        SELECT QTR, MARKET_SHARE AS NPA_MS
-        FROM {NPA_MS_TABLE}
-        WHERE UPPER(BRAND) = 'NURTEC'
-          AND UPPER(TYPE) = '{ct}'
-        """
-    ).to_pandas()
-    df.columns = [c.upper() for c in df.columns]
-    return df.sort_values("QTR").reset_index(drop=True)
+    df = _load_npa_ms()
+    sub = df[
+        (df["BRAND"].astype(str).str.upper() == "NURTEC")
+        & (df["TYPE"].astype(str).str.upper() == ct)
+    ]
+    out = sub[["QTR", "MARKET_SHARE"]].rename(columns={"MARKET_SHARE": "NPA_MS"})
+    return out.sort_values("QTR").reset_index(drop=True)
 
 
 # ---------- Quarter completeness ----------------------------------------
@@ -104,15 +176,20 @@ def npa_max_date() -> pd.Timestamp | None:
     """How far the NPA data extends.
 
     Returns None if the watermark can't be read, so a missing marker costs the
-    completeness callout rather than the whole app.
+    completeness callout rather than the whole app. Read positionally because
+    the single date column can be named differently across the two sources.
     """
     try:
-        session = _get_session()
-        df = session.sql(f"SELECT MAX_DT FROM {MAX_DATE_TABLE}").to_pandas()
-        df.columns = [c.upper() for c in df.columns]
-        if df.empty or pd.isna(df["MAX_DT"].iloc[0]):
+        df = _try_dataiku(DKU_MAX_DATE_DATASET)
+        if df is None:
+            session = _get_session()
+            df = session.sql(f"SELECT MAX_DT FROM {MAX_DATE_TABLE}").to_pandas()
+        if df is None or df.empty:
             return None
-        return pd.Timestamp(df["MAX_DT"].iloc[0])
+        val = df.iloc[0, 0]
+        if pd.isna(val):
+            return None
+        return pd.Timestamp(val)
     except Exception:
         return None
 

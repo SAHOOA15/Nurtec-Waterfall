@@ -1,12 +1,12 @@
 # Nurtec QoQ NBRx & TRx Waterfall
 
-Streamlit-in-Snowflake app that decomposes Nurtec's LAAD market-share change quarter-over-quarter into three levers (Written Demand / Rejections / Reversals) with a payer-level breakdown, and rescales the result to NPA (real-world) market share.
+Streamlit app, hosted as a **Dataiku webapp**, that decomposes Nurtec's LAAD market-share change quarter-over-quarter into three levers (Written Demand / Rejections / Reversals) with a payer-level breakdown, and rescales the result to NPA (real-world) market share.
 
 ## Layout
 
 - `streamlit_app.py` — app entrypoint, page layout, CSS injection
 - `src/`
-  - `data.py` — Snowflake queries + slicing helpers
+  - `data.py` — data loading (Dataiku datasets, Snowflake fallback) + slicing helpers
   - `waterfall.py` — lever decomposition math (matches the source Excel workbook)
   - `charts.py` — Altair waterfall + payer-breakdown renderers, themed to the PC-HUB design language
   - `qc.py` — Excel-style calculation walk-through tables
@@ -16,16 +16,37 @@ Streamlit-in-Snowflake app that decomposes Nurtec's LAAD market-share change qua
 
 ## Data sources
 
-All data is read from Snowflake at runtime. There is no bundled CSV and no Dataiku
-fallback — extracted LAAD/NPA data is licensed and is not kept in this repo.
+```
+Snowflake            Dataiku                  Streamlit
+(source tables)  ->  (managed datasets,   ->  (this app, hosted as
+                      scheduled refresh)       a Dataiku webapp)
+```
 
-- LAAD (quarterly, long-format): `<DB>.<SCHEMA>.<..._SQL_NURTEC_WATERFALL_QTR_METRICS>`
-- NPA market share (quarterly, pre-computed): `<DB>.<SCHEMA>.<..._SQL_NURTEC_WATERFALL_NPA_MARKET_SHARE_SF>`
-- NPA data watermark: `<DB>.<SCHEMA>.<..._SQL_NPA_MAX_DATE_SF>`
+`src/data.py` tries two loaders in order and uses the first that works:
+
+1. **Dataiku Dataset API** — `dataiku.Dataset(name).get_dataframe()`. The live path
+   when hosted on Dataiku. Dataiku refreshes these from Snowflake on a schedule.
+2. **Snowflake** — active Snowpark session, else `st.connection("snowflake")`. Keeps
+   the app runnable outside Dataiku.
+
+There is deliberately **no bundled CSV** — extracted LAAD/NPA data is licensed IQVIA
+plus competitive brand detail and must not live in this repo. `data/*.csv` is gitignored.
+
+| Purpose | Dataiku dataset | Snowflake table |
+|---|---|---|
+| LAAD quarter metrics | `SQL_NURTEC_WATERFALL_QTR_METRICS` | `<DB>.<SCHEMA>.<..._SQL_NURTEC_WATERFALL_QTR_METRICS>` |
+| NPA quarterly market share | `SQL_NURTEC_WATERFALL_NPA_MARKET_SHARE_SF` | `<DB>.<SCHEMA>.<..._SQL_NURTEC_WATERFALL_NPA_MARKET_SHARE_SF>` |
+| NPA data watermark | `SQL_NPA_MAX_DATE_SF` | `<DB>.<SCHEMA>.<..._SQL_NPA_MAX_DATE_SF>` |
+
+Dataiku dataset names are the Snowflake table name minus the schema prefix. Each can be
+overridden for testing via `DKU_LAAD_DATASET`, `DKU_NPA_MS_DATASET`, `DKU_MAX_DATE_DATASET`.
 
 The NPA table carries one row per `(QTR, BRAND, TYPE)` with `MARKET_SHARE` stored as a
-fraction (0–1). `TYPE` holds true `NBRx` and `TRx` grains — NBRx is not approximated
-from NRx.
+fraction (0–1) — do not rescale it. `TYPE` holds true `NBRx` and `TRx` grains (mixed case),
+so NBRx is **not** approximated from NRx.
+
+If a load fails, the error names both the Dataiku dataset and the Snowflake table it tried,
+so a dataset that has not been published yet is obvious rather than looking like an outage.
 
 ## Quarter completeness
 
@@ -37,7 +58,13 @@ quarter is complete and simply omits the notice.
 
 ## Deploy
 
-Files are deployed to Snowflake via `snow streamlit deploy` (or by uploading through Snowsight Workspaces). The container runtime is Python 3.11. The app expects to run inside Streamlit-in-Snowflake, where it picks up the active session; `st.connection("snowflake")` is used as a fallback.
+Primary target is a **Dataiku Streamlit webapp**: the datasets listed above must exist in
+the Dataiku project, and the app code is published through the Dataiku webapp. `dataiku`
+and `streamlit` are provided by the platform, so they are not pinned in `requirements.txt`.
+
+The repo also still carries `snowflake.yml` for Streamlit-in-Snowflake deployment via
+`snow streamlit deploy`. Note its `artifacts:` list is incomplete (it omits `src/`), so it
+would need fixing before that path works.
 
 ## Waterfall convention
 
