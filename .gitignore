@@ -32,6 +32,10 @@ _wf_chunks.txt
 _wf_out.txt
 _all_chunks.tsv
 
+# Extracted LAAD / NPA data -- licensed IQVIA plus competitive brand detail.
+# The app reads these from Snowflake; never commit local extracts.
+data/*.csv
+
 # Generated / temporary
 *.log
 *.tmp
