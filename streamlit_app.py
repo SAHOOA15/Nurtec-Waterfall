@@ -11,6 +11,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+# Local modules: data access (Snowflake), lever math, Altair renderers, QC tables.
 from src.data import (
     load_laad,
     npa_market_share_by_qtr,
